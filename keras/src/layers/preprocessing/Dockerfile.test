@@ -1,0 +1,54 @@
+# Multi-stage Dockerfile for testing Normalization layer across backends
+# Usage:
+#   docker build -f Dockerfile.test -t keras-norm-test .
+#   docker run keras-norm-test tensorflow
+#   docker run keras-norm-test jax
+#   docker run keras-norm-test torch
+
+FROM python:3.11-slim as base
+
+WORKDIR /workspace
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt requirements-common.txt ./
+
+# Install base Python packages
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# Stage for TensorFlow backend
+FROM base as tensorflow
+RUN pip install --no-cache-dir tensorflow-cpu
+RUN pip install --no-cache-dir -r requirements-common.txt
+ENV KERAS_BACKEND=tensorflow
+
+# Stage for JAX backend
+FROM base as jax
+RUN pip install --no-cache-dir "jax[cpu]" flax
+RUN pip install --no-cache-dir -r requirements-common.txt
+ENV KERAS_BACKEND=jax
+
+# Stage for PyTorch backend
+FROM base as torch
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir -r requirements-common.txt
+ENV KERAS_BACKEND=torch
+
+# Final stage - copy Keras code and run tests
+FROM ${BACKEND:-tensorflow} as final
+
+# Copy Keras source
+COPY . /workspace/keras
+
+# Install Keras in editable mode
+RUN cd /workspace/keras && pip install --no-deps -e .
+
+# Set working directory to tests
+WORKDIR /workspace/keras/keras/src/layers/preprocessing
+
+# Default command - run tests
+CMD ["pytest", "normalization_test.py", "-xvs", "--tb=short"]

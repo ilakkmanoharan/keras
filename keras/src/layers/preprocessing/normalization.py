@@ -126,6 +126,168 @@ class Normalization(DataLayer):
                 f"must be set. Received: mean={mean} and variance={variance}"
             )
 
+    def _reshape_or_broadcast(
+        self, tensor, name, expected_shape, broadcast_shape
+    ):
+        """Transform tensor to broadcast shape using shape-identity check.
+
+        This is the primary implementation (v1) that uses exact shape matching
+        to determine whether to reshape or broadcast_to. This approach was
+        chosen for its clarity, correctness, and good performance.
+
+        Strategy:
+        - If tensor.shape exactly matches expected_shape (compact form),
+          use reshape to add broadcast dimensions
+        - Otherwise (scalar, 1D, or already broadcast), use broadcast_to
+
+        Args:
+            tensor: The tensor to transform (mean or variance)
+            name: String name for error messages ("mean" or "variance")
+            expected_shape: The expected compact shape (kept axes only)
+            broadcast_shape: Target shape with 1s for reduced axes
+
+        Returns:
+            Tensor with shape matching broadcast_shape
+
+        Raises:
+            ValueError: If tensor shape matches expected but element count
+                doesn't match broadcast shape (indicating invalid input)
+
+        Examples:
+            >>> # Compact form: reshape
+            >>> tensor.shape = (2, 4), expected = (2, 4)
+            >>> broadcast = [1, 2, 1, 4]
+            >>> # Result: reshape (2, 4) -> [1, 2, 1, 4]
+
+            >>> # Scalar form: broadcast_to
+            >>> tensor.shape = (), expected = (3,)
+            >>> broadcast = [1, 3]
+            >>> # Result: broadcast_to () -> [1, 3]
+
+            >>> # Already broadcast: broadcast_to
+            >>> tensor.shape = (1, 2, 1, 4), expected = (2, 4)
+            >>> broadcast = [1, 2, 1, 4]
+            >>> # Result: broadcast_to [1,2,1,4] -> [1,2,1,4]
+        """
+        tensor_shape = tuple(tensor.shape)
+
+        if tensor_shape == expected_shape:
+            # Compact form: need to reshape to add broadcast dimensions
+            tensor_elements = math.prod(tensor_shape)
+            broadcast_elements = math.prod(broadcast_shape)
+
+            if tensor_elements != broadcast_elements:
+                raise ValueError(
+                    f"Cannot reshape {name} with shape {tensor_shape} "
+                    f"(containing {tensor_elements} elements) to broadcast "
+                    f"shape {broadcast_shape} (containing "
+                    f"{broadcast_elements} elements). The number of "
+                    f"elements must match. Expected {name} shape to match "
+                    f"the kept axes shape {expected_shape}."
+                )
+
+            return ops.reshape(tensor, broadcast_shape)
+        else:
+            # Scalar, 1D, or already broadcast: use broadcast_to
+            return ops.broadcast_to(tensor, broadcast_shape)
+
+    # Alternative implementations for comparison and testing
+    # These are not used in production but available for benchmarking
+
+    def _reshape_or_broadcast_v2_try_except(
+        self, tensor, name, expected_shape, broadcast_shape
+    ):
+        """Alternative v2: Try broadcast_to first, fallback to reshape.
+
+        Strategy: Attempt broadcast_to and catch errors, then try reshape.
+        This is more Pythonic ("easier to ask forgiveness") but has
+        overhead from exception handling.
+
+        Trade-offs:
+        + Simple logic, no complex conditionals
+        + Naturally handles all broadcastable cases
+        - Exception overhead when reshape is needed
+        - Backend-specific error types make catching fragile
+        - Less predictable performance (depends on error path)
+        """
+        try:
+            # Try broadcast_to first (works for scalar, 1D, already broadcast)
+            return ops.broadcast_to(tensor, broadcast_shape)
+        except Exception:
+            # Fallback to reshape for compact form
+            tensor_shape = tuple(tensor.shape)
+            if tensor_shape == expected_shape:
+                tensor_elements = math.prod(tensor_shape)
+                broadcast_elements = math.prod(broadcast_shape)
+                if tensor_elements != broadcast_elements:
+                    raise ValueError(
+                        f"Cannot reshape {name} with shape {tensor_shape} "
+                        f"to broadcast shape {broadcast_shape}: element "
+                        f"count mismatch ({tensor_elements} vs "
+                        f"{broadcast_elements})"
+                    )
+                return ops.reshape(tensor, broadcast_shape)
+            else:
+                # Re-raise original error if not compact form
+                raise
+
+    def _reshape_or_broadcast_v3_element_count(
+        self, tensor, name, expected_shape, broadcast_shape
+    ):
+        """Alternative v3: Use element count and rank heuristic.
+
+        Strategy: Check if element counts match and rank >= 2, use reshape.
+        Otherwise use broadcast_to.
+
+        Trade-offs:
+        + Fast checks (prod and len)
+        + Handles most cases correctly
+        - Heuristic may have false positives/negatives
+        - Less precise than shape-identity check
+        - Harder to reason about edge cases
+        """
+        tensor_shape = tuple(tensor.shape)
+        tensor_elements = math.prod(tensor_shape)
+        broadcast_elements = math.prod(broadcast_shape)
+        tensor_rank = len(tensor_shape)
+
+        if tensor_elements == broadcast_elements and tensor_rank >= 2:
+            # Likely compact form: use reshape
+            return ops.reshape(tensor, broadcast_shape)
+        else:
+            # Scalar, 1D, or already broadcast: use broadcast_to
+            return ops.broadcast_to(tensor, broadcast_shape)
+
+    def _reshape_or_broadcast_v4_unified(
+        self, tensor, name, expected_shape, broadcast_shape
+    ):
+        """Alternative v4: Always reshape to expected, then broadcast.
+
+        Strategy: First reshape to expected_shape (if not already),
+        then reshape to broadcast_shape.
+
+        Trade-offs:
+        + Unified code path
+        + Predictable behavior
+        - Extra reshape operation overhead
+        - More complex logic
+        - May not handle all edge cases well
+        """
+        tensor_shape = tuple(tensor.shape)
+
+        # First ensure we're in compact form
+        if tensor_shape != expected_shape:
+            # Try to broadcast to expected shape first
+            if math.prod(tensor_shape) == 1:
+                # Scalar: broadcast to expected shape
+                tensor = ops.broadcast_to(tensor, expected_shape)
+            else:
+                # Already in some other form, try direct broadcast
+                return ops.broadcast_to(tensor, broadcast_shape)
+
+        # Now reshape compact form to broadcast form
+        return ops.reshape(tensor, broadcast_shape)
+
     def build(self, input_shape):
         if input_shape is None:
             return
@@ -196,8 +358,19 @@ class Normalization(DataLayer):
             # with proper broadcast shape for use during call.
             mean = ops.convert_to_tensor(self.input_mean)
             variance = ops.convert_to_tensor(self.input_variance)
-            mean = ops.broadcast_to(mean, self._broadcast_shape)
-            variance = ops.broadcast_to(variance, self._broadcast_shape)
+
+            # Apply broadcasting/reshaping to match the broadcast shape.
+            # Uses shape-identity approach (gh-22065 fix).
+            mean = self._reshape_or_broadcast(
+                mean, "mean", self._mean_and_var_shape, self._broadcast_shape
+            )
+            variance = self._reshape_or_broadcast(
+                variance,
+                "variance",
+                self._mean_and_var_shape,
+                self._broadcast_shape,
+            )
+
             self.mean = ops.cast(mean, dtype=self.compute_dtype)
             self.variance = ops.cast(variance, dtype=self.compute_dtype)
 
